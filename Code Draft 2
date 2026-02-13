@@ -1,0 +1,724 @@
+# IPCA Problem Set - Google Colab Version (v2)
+# Problems 2 & 3: Estimate IPCA models and compare by market cap
+# Updated: Configurable date range (default 2000-2020)
+
+!pip install wrds -q
+
+import wrds
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# DATE RANGE CONFIGURATION
+# Change these variables to adjust the sample period
+# ============================================================
+START_YEAR = 2000
+END_YEAR = 2020
+START_DATE = f'{START_YEAR}-01-01'
+END_DATE = f'{END_YEAR}-12-31'
+# ============================================================
+
+print("Starting IPCA analysis...")
+print(f"Sample period: {START_YEAR} - {END_YEAR}")
+print("="*80)
+# Connect to WRDS
+print("\nConnecting to WRDS...")
+print("You'll be prompted to enter your WRDS username and password")
+
+db = wrds.Connection()
+print("Connected to WRDS successfully!")
+# Load the datashare.csv file
+print("\nLoading datashare.csv...")
+print("(This may take a minute for a large file...)")
+
+signals_data = pd.read_csv('/content/drive/MyDrive/Stock Data/datashare.csv')
+
+print(f"\n✓ Loaded successfully!")
+print(f"  Shape: {signals_data.shape}")
+print(f"  Rows: {len(signals_data):,}")
+print(f"  Columns: {len(signals_data.columns):,}")
+print(f"\n  First few rows:")
+print(signals_data.head())
+# Process the signals data - identify date and permno columns
+
+print("\n" + "="*80)
+print("PROCESSING SIGNALS DATA")
+print("="*80)
+
+# Show available columns
+print("\nAvailable columns (first 30):")
+for i, col in enumerate(signals_data.columns[:30], 1):
+    print(f"  {i:2d}. {col}")
+
+if len(signals_data.columns) > 30:
+    print(f"  ... and {len(signals_data.columns) - 30} more")
+
+# Identify date column
+date_col = None
+for col in ['date', 'DATE', 'eom', 'yyyymm', 'DATE_', 'month', 'mdate']:
+    if col in signals_data.columns:
+        date_col = col
+        print(f"\n✓ Found date column: '{date_col}'")
+        break
+
+if date_col is None:
+    print("\n⚠ Could not automatically identify date column.")
+    print("  Common date column names: date, DATE, eom, yyyymm")
+    print("  Please check the column list above and manually specify.")
+    # You can manually set it here:
+    # date_col = 'YOUR_DATE_COLUMN_NAME'
+
+# Convert to datetime
+signals_data['date'] = pd.to_datetime(signals_data[date_col])
+
+# Identify PERMNO column
+permno_col = None
+for col in ['permno', 'PERMNO', 'LPERMNO', 'permno_', 'PERMNO_']:
+    if col in signals_data.columns:
+        permno_col = col
+        print(f"✓ Found PERMNO column: '{permno_col}'")
+        break
+
+if permno_col is None:
+    print("\n⚠ Could not automatically identify PERMNO column.")
+    # You can manually set it here:
+    # permno_col = 'YOUR_PERMNO_COLUMN_NAME'
+
+# Ensure we have a 'permno' column
+if permno_col != 'permno':
+    signals_data['permno'] = signals_data[permno_col]
+
+# Filter signals data to the configured date range
+signals_data = signals_data[(signals_data['date'] >= START_DATE) & (signals_data['date'] <= END_DATE)]
+
+print(f"\n✓ Processed signals data:")
+print(f"  Date range: {signals_data['date'].min()} to {signals_data['date'].max()}")
+print(f"  Unique stocks: {signals_data['permno'].nunique():,}")
+print(f"  (Filtered to {START_YEAR}-{END_YEAR})")
+# Identify characteristic columns (exclude identifiers and date columns)
+exclude_cols = ['permno', 'date', 'PERMNO', 'DATE', 'eom', 'yyyymm', 'DATE_', 'month', 'mdate',
+                'LPERMNO', 'permno_', 'PERMNO_', 'ret', 'RET', 'me', 'ME', 'mktcap']
+char_cols = [col for col in signals_data.columns if col not in exclude_cols]
+
+print(f"\n✓ Identified {len(char_cols)} characteristic columns")
+
+# Filter signals data: remove rows with too many missing characteristics
+signals_data_filtered = signals_data.dropna(subset=char_cols, thresh=int(len(char_cols) * 0.5))
+print(f"✓ Filtered signals data: {len(signals_data_filtered):,} rows remaining")
+
+# Fetch monthly returns from WRDS (CRSP) - using configured date range
+print(f"\nFetching monthly returns from CRSP ({START_YEAR}-{END_YEAR})...")
+
+monthly_returns = db.raw_sql(f"""
+    SELECT a.permno, a.date, a.ret, a.shrout, a.prc,
+           abs(a.prc) * a.shrout AS me
+    FROM crsp.msf AS a
+    INNER JOIN crsp.msenames AS b
+    ON a.permno = b.permno
+    AND b.namedt <= a.date
+    AND a.date <= b.nameendt
+    AND b.exchcd BETWEEN 1 AND 3
+    AND b.shrcd BETWEEN 10 AND 11
+    WHERE a.date BETWEEN '{START_DATE}' AND '{END_DATE}'
+    AND a.ret IS NOT NULL
+""")
+
+monthly_returns['date'] = pd.to_datetime(monthly_returns['date'])
+monthly_returns['date'] = monthly_returns['date'] + pd.offsets.MonthEnd(0)
+
+print(f"✓ Fetched {len(monthly_returns):,} monthly return observations")
+print(f"  Date range: {monthly_returns['date'].min()} to {monthly_returns['date'].max()}")
+print(f"  Unique stocks: {monthly_returns['permno'].nunique():,}")
+# Merge returns with lagged characteristics
+print("\n" + "="*80)
+print("MERGING DATA")
+print("="*80)
+
+# Create lagged characteristics (shift forward one month)
+signals_data_filtered = signals_data_filtered.sort_values(['permno', 'date'])
+signals_lagged = signals_data_filtered.copy()
+signals_lagged['date'] = signals_lagged['date'] + pd.DateOffset(months=1)
+signals_lagged = signals_lagged[['permno', 'date'] + char_cols]
+
+# Merge with returns
+merged_data = monthly_returns.merge(
+    signals_lagged,
+    on=['permno', 'date'],
+    how='inner'
+)
+
+print(f"\n✓ Merged data shape: {merged_data.shape}")
+print(f"  Observations: {len(merged_data):,}")
+print(f"  Date range: {merged_data['date'].min()} to {merged_data['date'].max()}")
+print(f"  Unique stocks: {merged_data['permno'].nunique():,}")
+
+# Check for missing values
+print("\nChecking for missing values in characteristics...")
+missing_pct = merged_data[char_cols].isnull().sum() / len(merged_data) * 100
+n_high_missing = (missing_pct > 50).sum()
+
+print(f"  Characteristics with >50% missing: {n_high_missing}")
+
+if n_high_missing > 0:
+    print("\n  Top 10 characteristics with highest missing %:")
+    high_missing = missing_pct[missing_pct > 50].sort_values(ascending=False)
+    for char, pct in high_missing.head(10).items():
+        print(f"    {char:40s} {pct:6.1f}%")
+
+# Remove characteristics with too many missing values
+char_cols_clean = [col for col in char_cols if missing_pct[col] <= 50]
+print(f"\n✓ Using {len(char_cols_clean)} characteristics after removing high-missing columns")
+
+# Remove rows with any missing characteristics
+merged_data_clean = merged_data.dropna(subset=char_cols_clean)
+print(f"✓ Final dataset: {len(merged_data_clean):,} observations after removing missing values")
+# IPCA Implementation
+
+class IPCA:
+    """
+    Instrumented Principal Components Analysis (IPCA)
+    Following Kelly, Pruitt, and Su (2019)
+    """
+    def __init__(self, n_factors=3, max_iter=100, tol=1e-4):
+        self.n_factors = n_factors
+        self.max_iter = max_iter
+        self.tol = tol
+        self.Gamma = None
+        self.factors = None
+        self.char_cols = None
+
+    def fit(self, returns_df, characteristics_df, char_cols):
+        """
+        Fit IPCA model
+
+        Parameters:
+        -----------
+        returns_df : DataFrame with columns ['permno', 'date', 'ret']
+        characteristics_df : DataFrame with columns ['permno', 'date'] + char_cols
+        char_cols : list of characteristic column names
+        """
+        # Merge returns and characteristics
+        data = returns_df[['permno', 'date', 'ret']].merge(
+            characteristics_df[['permno', 'date'] + char_cols],
+            on=['permno', 'date'],
+            how='inner'
+        )
+
+        # Drop rows with missing values
+        data = data.dropna()
+
+        # Get unique dates and sort
+        dates = sorted(data['date'].unique())
+
+        # Standardize characteristics within each time period
+        print("  Standardizing characteristics...")
+        scaler = StandardScaler()
+        for date in dates:
+            mask = data['date'] == date
+            if mask.sum() > 1:
+                data.loc[mask, char_cols] = scaler.fit_transform(data.loc[mask, char_cols])
+
+        # Initialize
+        T = len(dates)
+        L = len(char_cols)
+        K = self.n_factors
+
+        print(f"\n  IPCA Estimation:")
+        print(f"    Time periods (T): {T}")
+        print(f"    Characteristics (L): {L}")
+        print(f"    Factors (K): {K}")
+        print(f"    Total observations: {len(data):,}")
+
+        # Initialize Gamma (L x K matrix)
+        np.random.seed(42)
+        Gamma = np.random.randn(L, K) * 0.01
+
+        # Initialize factors (T x K matrix)
+        factors = np.zeros((T, K))
+
+        # Alternating least squares
+        print("\n  Running alternating least squares...")
+        for iteration in range(self.max_iter):
+            Gamma_old = Gamma.copy()
+
+            # Step 1: Update factors given Gamma
+            for t, date in enumerate(dates):
+                data_t = data[data['date'] == date].copy()
+
+                if len(data_t) < 10:
+                    continue
+
+                Z_t = data_t[char_cols].values
+                r_t = data_t['ret'].values
+                beta_t = Z_t @ Gamma
+
+                try:
+                    factors[t, :] = np.linalg.solve(
+                        beta_t.T @ beta_t + 1e-6 * np.eye(K),
+                        beta_t.T @ r_t
+                    )
+                except np.linalg.LinAlgError:
+                    factors[t, :] = 0
+
+            # Step 2: Update Gamma given factors
+            Z_list = []
+            r_list = []
+            f_list = []
+
+            for t, date in enumerate(dates):
+                data_t = data[data['date'] == date].copy()
+
+                if len(data_t) < 10:
+                    continue
+
+                Z_t = data_t[char_cols].values
+                r_t = data_t['ret'].values
+
+                for i in range(len(data_t)):
+                    Z_list.append(Z_t[i, :])
+                    r_list.append(r_t[i])
+                    f_list.append(factors[t, :])
+
+            Z_all = np.array(Z_list)
+            r_all = np.array(r_list)
+            f_all = np.array(f_list)
+
+            # Update Gamma
+            Gamma_new = np.zeros((L, K))
+
+            for k in range(K):
+                X_k = Z_all * f_all[:, k].reshape(-1, 1)
+                try:
+                    Gamma_new[:, k] = np.linalg.solve(
+                        X_k.T @ X_k + 1e-6 * np.eye(L),
+                        X_k.T @ r_all
+                    )
+                except np.linalg.LinAlgError:
+                    Gamma_new[:, k] = Gamma[:, k]
+
+            Gamma = Gamma_new
+
+            # Check convergence
+            change = np.linalg.norm(Gamma - Gamma_old) / (np.linalg.norm(Gamma_old) + 1e-10)
+
+            if iteration % 10 == 0:
+                print(f"    Iteration {iteration}: change = {change:.6f}")
+
+            if change < self.tol:
+                print(f"  ✓ Converged after {iteration + 1} iterations")
+                break
+
+        # Normalize factors
+        for k in range(K):
+            factor_std = np.std(factors[:, k])
+            if factor_std > 1e-6:
+                factors[:, k] = factors[:, k] / factor_std
+                Gamma[:, k] = Gamma[:, k] * factor_std
+
+        # Store results
+        self.Gamma = Gamma
+        self.factors = pd.DataFrame(
+            factors,
+            index=dates,
+            columns=[f'Factor_{i+1}' for i in range(K)]
+        )
+        self.char_cols = char_cols
+        self.data = data
+        self.dates = dates
+
+        return self
+
+    def calculate_metrics(self):
+        """Calculate Total R², Relative Pricing Error, and Spread Portfolio Sharpe Ratio"""
+        print("\n  Calculating performance metrics...")
+
+        data = self.data
+        dates = self.dates
+
+        # Calculate fitted returns
+        fitted_returns = []
+        actual_returns = []
+
+        for t, date in enumerate(dates):
+            data_t = data[data['date'] == date].copy()
+
+            if len(data_t) < 10:
+                continue
+
+            Z_t = data_t[self.char_cols].values
+            r_t = data_t['ret'].values
+            f_t = self.factors.loc[date].values
+
+            beta_t = Z_t @ self.Gamma
+            r_fitted = beta_t @ f_t
+
+            fitted_returns.extend(r_fitted)
+            actual_returns.extend(r_t)
+
+        fitted_returns = np.array(fitted_returns)
+        actual_returns = np.array(actual_returns)
+
+        # 1. Total R²
+        ss_res = np.sum((actual_returns - fitted_returns)**2)
+        ss_tot = np.sum(actual_returns**2)
+        total_r2 = 1 - (ss_res / ss_tot)
+
+        # 2. Relative Pricing Error
+        alphas = {}
+        mean_returns = {}
+
+        for permno in data['permno'].unique():
+            stock_data = data[data['permno'] == permno].copy()
+
+            r_actual_list = []
+            r_fitted_list = []
+
+            for _, row in stock_data.iterrows():
+                date = row['date']
+                if date in self.factors.index:
+                    Z_i = row[self.char_cols].values
+                    f_t = self.factors.loc[date].values
+                    beta_i = Z_i @ self.Gamma
+
+                    r_actual_list.append(row['ret'])
+                    r_fitted_list.append(beta_i @ f_t)
+
+            if len(r_actual_list) > 0:
+                mean_returns[permno] = np.mean(r_actual_list)
+                alphas[permno] = np.mean(r_actual_list) - np.mean(r_fitted_list)
+
+        alpha_array = np.array(list(alphas.values()))
+        mean_ret_array = np.array(list(mean_returns.values()))
+
+        relative_pricing_error = np.sqrt(np.mean(alpha_array**2)) / np.sqrt(np.mean(mean_ret_array**2))
+
+        # 3. Spread Portfolio Sharpe Ratio
+        spread_returns = []
+
+        for t, date in enumerate(dates):
+            data_t = data[data['date'] == date].copy()
+
+            if len(data_t) < 50:
+                continue
+
+            Z_t = data_t[self.char_cols].values
+            f_mean = self.factors.mean().values
+            beta_t = Z_t @ self.Gamma
+            exp_ret_t = beta_t @ f_mean
+
+            data_t['exp_ret'] = exp_ret_t
+
+            try:
+                data_t['quintile'] = pd.qcut(data_t['exp_ret'], 5, labels=False, duplicates='drop')
+            except ValueError:
+                continue
+
+            q5_ret = data_t[data_t['quintile'] == 4]['ret'].mean()
+            q1_ret = data_t[data_t['quintile'] == 0]['ret'].mean()
+
+            if not (np.isnan(q5_ret) or np.isnan(q1_ret)):
+                spread_returns.append(q5_ret - q1_ret)
+
+        spread_returns = np.array(spread_returns)
+        sharpe_ratio = np.mean(spread_returns) / np.std(spread_returns) * np.sqrt(12)
+
+        return {
+            'total_r2': total_r2,
+            'relative_pricing_error': relative_pricing_error,
+            'sharpe_ratio': sharpe_ratio
+        }
+
+print("✓ IPCA class defined")
+# PROBLEM 2: Estimate 3-factor IPCA model
+
+print("\n" + "="*80)
+print("PROBLEM 2: 3-FACTOR IPCA MODEL")
+print(f"Sample period: {START_YEAR} - {END_YEAR}")
+print("="*80)
+
+# Prepare data for IPCA
+returns_df = merged_data_clean[['permno', 'date', 'ret']].copy()
+chars_df = merged_data_clean[['permno', 'date'] + char_cols_clean].copy()
+
+print("\nEstimating IPCA model...")
+print("(This may take several minutes...)")
+
+# Estimate IPCA
+ipca_full = IPCA(n_factors=3, max_iter=100, tol=1e-4)
+ipca_full.fit(returns_df, chars_df, char_cols_clean)
+
+# Calculate metrics
+metrics_full = ipca_full.calculate_metrics()
+
+print("\n" + "="*80)
+print(f"RESULTS: 3-Factor IPCA Model (Full Sample, {START_YEAR}-{END_YEAR})")
+print("="*80)
+print(f"Total R²:                    {metrics_full['total_r2']:.4f} ({metrics_full['total_r2']*100:.2f}%)")
+print(f"Relative Pricing Error:      {metrics_full['relative_pricing_error']:.4f} ({metrics_full['relative_pricing_error']*100:.2f}%)")
+print(f"Spread Portfolio Sharpe:     {metrics_full['sharpe_ratio']:.4f}")
+print("="*80)
+
+# Display top Gamma coefficients
+gamma_df = pd.DataFrame(
+    ipca_full.Gamma,
+    index=char_cols_clean,
+    columns=[f'Factor_{i+1}' for i in range(3)]
+)
+
+print("\nTop 20 Characteristics by Absolute Gamma (Factor 1):")
+print("-"*80)
+gamma_sorted = gamma_df['Factor_1'].abs().sort_values(ascending=False)
+for i, (char, val) in enumerate(gamma_sorted.head(20).items(), 1):
+    print(f"{i:2d}. {char:40s} {val:8.4f}")
+# PROBLEM 3: Split by market cap and estimate separately
+
+print("\n" + "="*80)
+print("PROBLEM 3: SPLIT BY MARKET CAPITALIZATION")
+print(f"Sample period: {START_YEAR} - {END_YEAR}")
+print("="*80)
+
+# Calculate median market cap each month
+merged_data_clean['me_median'] = merged_data_clean.groupby('date')['me'].transform('median')
+merged_data_clean['above_median'] = (merged_data_clean['me'] > merged_data_clean['me_median']).astype(int)
+
+print(f"\nSmall cap observations: {(merged_data_clean['above_median'] == 0).sum():,}")
+print(f"Large cap observations: {(merged_data_clean['above_median'] == 1).sum():,}")
+
+# Small cap (below median)
+print("\n" + "-"*80)
+print("SMALL CAP STOCKS (Below Median Market Cap)")
+print("-"*80)
+
+small_cap_data = merged_data_clean[merged_data_clean['above_median'] == 0].copy()
+returns_small = small_cap_data[['permno', 'date', 'ret']].copy()
+chars_small = small_cap_data[['permno', 'date'] + char_cols_clean].copy()
+
+print("\nEstimating small cap model...")
+ipca_small = IPCA(n_factors=3, max_iter=100, tol=1e-4)
+ipca_small.fit(returns_small, chars_small, char_cols_clean)
+metrics_small = ipca_small.calculate_metrics()
+
+print(f"\n✓ Small Cap Results:")
+print(f"    Total R²:                 {metrics_small['total_r2']:.4f}")
+print(f"    Relative Pricing Error:   {metrics_small['relative_pricing_error']:.4f}")
+print(f"    Spread Portfolio Sharpe:  {metrics_small['sharpe_ratio']:.4f}")
+
+# Large cap (above median)
+print("\n" + "-"*80)
+print("LARGE CAP STOCKS (Above Median Market Cap)")
+print("-"*80)
+
+large_cap_data = merged_data_clean[merged_data_clean['above_median'] == 1].copy()
+returns_large = large_cap_data[['permno', 'date', 'ret']].copy()
+chars_large = large_cap_data[['permno', 'date'] + char_cols_clean].copy()
+
+print("\nEstimating large cap model...")
+ipca_large = IPCA(n_factors=3, max_iter=100, tol=1e-4)
+ipca_large.fit(returns_large, chars_large, char_cols_clean)
+metrics_large = ipca_large.calculate_metrics()
+
+print(f"\n✓ Large Cap Results:")
+print(f"    Total R²:                 {metrics_large['total_r2']:.4f}")
+print(f"    Relative Pricing Error:   {metrics_large['relative_pricing_error']:.4f}")
+print(f"    Spread Portfolio Sharpe:  {metrics_large['sharpe_ratio']:.4f}")
+# Comparison and Analysis
+
+print("\n" + "="*80)
+print("COMPARISON OF MODELS")
+print("="*80)
+
+comparison_df = pd.DataFrame({
+    'Metric': ['Total R²', 'Relative Pricing Error', 'Sharpe Ratio'],
+    'Full Sample': [
+        f"{metrics_full['total_r2']:.4f}",
+        f"{metrics_full['relative_pricing_error']:.4f}",
+        f"{metrics_full['sharpe_ratio']:.4f}"
+    ],
+    'Small Cap': [
+        f"{metrics_small['total_r2']:.4f}",
+        f"{metrics_small['relative_pricing_error']:.4f}",
+        f"{metrics_small['sharpe_ratio']:.4f}"
+    ],
+    'Large Cap': [
+        f"{metrics_large['total_r2']:.4f}",
+        f"{metrics_large['relative_pricing_error']:.4f}",
+        f"{metrics_large['sharpe_ratio']:.4f}"
+    ],
+    'Difference (S-L)': [
+        f"{metrics_small['total_r2'] - metrics_large['total_r2']:.4f}",
+        f"{metrics_small['relative_pricing_error'] - metrics_large['relative_pricing_error']:.4f}",
+        f"{metrics_small['sharpe_ratio'] - metrics_large['sharpe_ratio']:.4f}"
+    ]
+})
+
+print("\n" + comparison_df.to_string(index=False))
+print("="*80)
+
+# Gamma matrices
+gamma_small_df = pd.DataFrame(
+    ipca_small.Gamma,
+    index=char_cols_clean,
+    columns=[f'Factor_{i+1}' for i in range(3)]
+)
+
+gamma_large_df = pd.DataFrame(
+    ipca_large.Gamma,
+    index=char_cols_clean,
+    columns=[f'Factor_{i+1}' for i in range(3)]
+)
+
+print("\n" + "="*80)
+print("GAMMA MATRIX COMPARISON (Top 15 Characteristics)")
+print("="*80)
+
+top_chars = gamma_df['Factor_1'].abs().sort_values(ascending=False).head(15).index.tolist()
+
+gamma_comp = pd.DataFrame({
+    'Characteristic': top_chars,
+    'Small Cap': [gamma_small_df.loc[char, 'Factor_1'] for char in top_chars],
+    'Large Cap': [gamma_large_df.loc[char, 'Factor_1'] for char in top_chars],
+})
+gamma_comp['Diff (S-L)'] = gamma_comp['Small Cap'] - gamma_comp['Large Cap']
+gamma_comp['Abs Diff'] = gamma_comp['Diff (S-L)'].abs()
+gamma_comp = gamma_comp.sort_values('Abs Diff', ascending=False)
+
+print("\n" + gamma_comp[['Characteristic', 'Small Cap', 'Large Cap', 'Diff (S-L)']].to_string(index=False))
+# Visualizations
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig.suptitle(f'IPCA Analysis Results ({START_YEAR}-{END_YEAR})', fontsize=16, fontweight='bold', y=1.02)
+
+# Plot 1: Factor time series
+axes[0, 0].plot(ipca_full.factors.index, ipca_full.factors['Factor_1'],
+                label='Factor 1', alpha=0.7, linewidth=1.5)
+axes[0, 0].plot(ipca_full.factors.index, ipca_full.factors['Factor_2'],
+                label='Factor 2', alpha=0.7, linewidth=1.5)
+axes[0, 0].plot(ipca_full.factors.index, ipca_full.factors['Factor_3'],
+                label='Factor 3', alpha=0.7, linewidth=1.5)
+axes[0, 0].axhline(y=0, color='black', linestyle='--', alpha=0.3)
+axes[0, 0].set_title('IPCA Factors (Full Sample)', fontsize=12, fontweight='bold')
+axes[0, 0].set_xlabel('Date')
+axes[0, 0].set_ylabel('Factor Return')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+# Plot 2: Performance comparison
+metrics_data = pd.DataFrame({
+    'Small Cap': [metrics_small['total_r2'],
+                  metrics_small['relative_pricing_error'],
+                  metrics_small['sharpe_ratio']/3],
+    'Large Cap': [metrics_large['total_r2'],
+                  metrics_large['relative_pricing_error'],
+                  metrics_large['sharpe_ratio']/3]
+}, index=['Total R²', 'Rel. Pricing Err', 'Sharpe/3'])
+
+metrics_data.plot(kind='bar', ax=axes[0, 1], color=['#2E86AB', '#A23B72'])
+axes[0, 1].set_title('Performance Metrics Comparison', fontsize=12, fontweight='bold')
+axes[0, 1].set_ylabel('Value')
+axes[0, 1].legend(loc='best')
+axes[0, 1].grid(True, alpha=0.3, axis='y')
+plt.setp(axes[0, 1].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+# Plot 3: Top Gamma coefficients
+top_10_chars = gamma_df['Factor_1'].abs().sort_values(ascending=False).head(10).index
+gamma_plot = pd.DataFrame({
+    'Small': [gamma_small_df.loc[char, 'Factor_1'] for char in top_10_chars],
+    'Large': [gamma_large_df.loc[char, 'Factor_1'] for char in top_10_chars]
+}, index=[char[:25] for char in top_10_chars])
+
+gamma_plot.plot(kind='barh', ax=axes[0, 2], color=['#2E86AB', '#A23B72'])
+axes[0, 2].set_title('Top 10 Gamma Coefficients (Factor 1)', fontsize=12, fontweight='bold')
+axes[0, 2].set_xlabel('Coefficient')
+axes[0, 2].legend(['Small Cap', 'Large Cap'])
+axes[0, 2].grid(True, alpha=0.3, axis='x')
+
+# Plot 4: Factor correlation
+factor_corr = np.zeros((3, 3))
+for i in range(3):
+    for j in range(3):
+        common_dates = ipca_small.factors.index.intersection(ipca_large.factors.index)
+        small_factor = ipca_small.factors.loc[common_dates, f'Factor_{i+1}']
+        large_factor = ipca_large.factors.loc[common_dates, f'Factor_{j+1}']
+        factor_corr[i, j] = np.corrcoef(small_factor, large_factor)[0, 1]
+
+sns.heatmap(factor_corr, annot=True, fmt='.3f', cmap='RdBu_r', center=0,
+            xticklabels=[f'Large F{i+1}' for i in range(3)],
+            yticklabels=[f'Small F{i+1}' for i in range(3)],
+            ax=axes[1, 0], vmin=-1, vmax=1)
+axes[1, 0].set_title('Factor Correlations: Small vs Large Cap', fontsize=12, fontweight='bold')
+
+# Plot 5: Cumulative returns
+axes[1, 1].plot(ipca_full.factors.index, (1 + ipca_full.factors['Factor_1']).cumprod(),
+                label='Full', linewidth=2)
+axes[1, 1].plot(ipca_small.factors.index, (1 + ipca_small.factors['Factor_1']).cumprod(),
+                label='Small', alpha=0.7)
+axes[1, 1].plot(ipca_large.factors.index, (1 + ipca_large.factors['Factor_1']).cumprod(),
+                label='Large', alpha=0.7)
+axes[1, 1].set_title('Cumulative Factor 1 Returns', fontsize=12, fontweight='bold')
+axes[1, 1].set_xlabel('Date')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
+axes[1, 1].set_yscale('log')
+
+# Plot 6: Characteristic importance
+gamma_importance = gamma_df.abs().mean(axis=1).sort_values(ascending=False).head(20)
+axes[1, 2].barh(range(len(gamma_importance)), gamma_importance.values, color='steelblue')
+axes[1, 2].set_yticks(range(len(gamma_importance)))
+axes[1, 2].set_yticklabels([name[:30] for name in gamma_importance.index], fontsize=8)
+axes[1, 2].set_xlabel('Mean |Gamma|')
+axes[1, 2].set_title('Top 20 Characteristics', fontsize=12, fontweight='bold')
+axes[1, 2].grid(True, alpha=0.3, axis='x')
+
+plt.tight_layout()
+plt.savefig('ipca_results.png', dpi=300, bbox_inches='tight')
+print("\n✓ Saved visualization to 'ipca_results.png'")
+plt.show()
+# Save results to CSV files
+
+print("\n" + "="*80)
+print("SAVING RESULTS")
+print("="*80)
+
+# Metrics summary
+metrics_summary = pd.DataFrame({
+    'Model': ['Full Sample', 'Small Cap', 'Large Cap'],
+    'Sample_Period': [f'{START_YEAR}-{END_YEAR}'] * 3,
+    'Total_R2': [metrics_full['total_r2'], metrics_small['total_r2'], metrics_large['total_r2']],
+    'Relative_Pricing_Error': [metrics_full['relative_pricing_error'],
+                                metrics_small['relative_pricing_error'],
+                                metrics_large['relative_pricing_error']],
+    'Sharpe_Ratio': [metrics_full['sharpe_ratio'], metrics_small['sharpe_ratio'], metrics_large['sharpe_ratio']],
+    'N_Observations': [len(ipca_full.data), len(ipca_small.data), len(ipca_large.data)]
+})
+
+metrics_summary.to_csv('ipca_metrics_summary.csv', index=False)
+print("✓ Saved: ipca_metrics_summary.csv")
+
+# Gamma matrices
+gamma_df.to_csv('gamma_full_sample.csv')
+gamma_small_df.to_csv('gamma_small_cap.csv')
+gamma_large_df.to_csv('gamma_large_cap.csv')
+print("✓ Saved: gamma_*.csv files")
+
+# Factor time series
+ipca_full.factors.to_csv('factors_full_sample.csv')
+ipca_small.factors.to_csv('factors_small_cap.csv')
+ipca_large.factors.to_csv('factors_large_cap.csv')
+print("✓ Saved: factors_*.csv files")
+
+print("\n" + "="*80)
+print("✓ ANALYSIS COMPLETE!")
+print(f"  Sample period: {START_YEAR} - {END_YEAR}")
+print("="*80)
+print("\nGenerated files:")
+print("  - ipca_results.png (visualizations)")
+print("  - ipca_metrics_summary.csv (summary table)")
+print("  - gamma_*.csv (Gamma coefficient matrices)")
+print("  - factors_*.csv (factor time series)")
