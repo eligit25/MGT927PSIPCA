@@ -75,9 +75,23 @@ if date_col is None:
     # You can manually set it here:
     # date_col = 'YOUR_DATE_COLUMN_NAME'
 
-# Convert to datetime and snap to month-end for consistent merging with CRSP
-signals_data['date'] = pd.to_datetime(signals_data[date_col])
-signals_data['date'] = signals_data['date'] + pd.offsets.MonthEnd(0)
+# Convert to datetime - handle multiple possible formats (YYYYMMDD, YYYYMM, etc.)
+raw_dates = signals_data[date_col]
+print(f"\n  Raw date column dtype: {raw_dates.dtype}")
+print(f"  Raw date sample values: {raw_dates.head(3).tolist()}")
+
+# If dates look like integers (e.g. 200001 for Jan 2000), convert via string
+if raw_dates.dtype in ['int64', 'float64']:
+    raw_str = raw_dates.astype(int).astype(str)
+    if raw_str.str.len().mode()[0] == 6:  # YYYYMM format
+        signals_data['date'] = pd.to_datetime(raw_str, format='%Y%m')
+    else:  # YYYYMMDD format
+        signals_data['date'] = pd.to_datetime(raw_str, format='%Y%m%d')
+else:
+    signals_data['date'] = pd.to_datetime(raw_dates)
+
+# Create a year-month key for robust merging (avoids day-of-month mismatch)
+signals_data['ym'] = signals_data['date'].dt.to_period('M')
 
 # Identify PERMNO column
 permno_col = None
@@ -92,19 +106,24 @@ if permno_col is None:
     # You can manually set it here:
     # permno_col = 'YOUR_PERMNO_COLUMN_NAME'
 
-# Ensure we have a 'permno' column
+# Ensure we have a 'permno' column and cast to int for consistent merge
 if permno_col != 'permno':
     signals_data['permno'] = signals_data[permno_col]
+signals_data['permno'] = signals_data['permno'].astype(int)
 
-# Filter signals data to the configured date range
-signals_data = signals_data[(signals_data['date'] >= START_DATE) & (signals_data['date'] <= END_DATE)]
+# Filter signals data to the configured date range using year
+signals_data = signals_data[
+    (signals_data['date'].dt.year >= START_YEAR) &
+    (signals_data['date'].dt.year <= END_YEAR)
+]
 
 print(f"\n✓ Processed signals data:")
 print(f"  Date range: {signals_data['date'].min()} to {signals_data['date'].max()}")
 print(f"  Unique stocks: {signals_data['permno'].nunique():,}")
+print(f"  Unique year-months: {signals_data['ym'].nunique()}")
 print(f"  (Filtered to {START_YEAR}-{END_YEAR})")
 # Identify characteristic columns (exclude identifiers and date columns)
-exclude_cols = ['permno', 'date', 'PERMNO', 'DATE', 'eom', 'yyyymm', 'DATE_', 'month', 'mdate',
+exclude_cols = ['permno', 'date', 'ym', 'PERMNO', 'DATE', 'eom', 'yyyymm', 'DATE_', 'month', 'mdate',
                 'LPERMNO', 'permno_', 'PERMNO_', 'ret', 'RET', 'me', 'ME', 'mktcap']
 char_cols = [col for col in signals_data.columns if col not in exclude_cols]
 
@@ -133,6 +152,8 @@ monthly_returns = db.raw_sql(f"""
 
 monthly_returns['date'] = pd.to_datetime(monthly_returns['date'])
 monthly_returns['date'] = monthly_returns['date'] + pd.offsets.MonthEnd(0)
+monthly_returns['permno'] = monthly_returns['permno'].astype(int)
+monthly_returns['ym'] = monthly_returns['date'].dt.to_period('M')
 
 print(f"✓ Fetched {len(monthly_returns):,} monthly return observations")
 print(f"  Date range: {monthly_returns['date'].min()} to {monthly_returns['date'].max()}")
@@ -142,23 +163,27 @@ print("\n" + "="*80)
 print("MERGING DATA")
 print("="*80)
 
-# Create lagged characteristics (shift forward one month)
+# Create lagged characteristics (shift forward one month using year-month period)
 signals_data_filtered = signals_data_filtered.sort_values(['permno', 'date'])
 signals_lagged = signals_data_filtered.copy()
-signals_lagged['date'] = signals_lagged['date'] + pd.DateOffset(months=1)
-signals_lagged['date'] = signals_lagged['date'] + pd.offsets.MonthEnd(0)
-signals_lagged = signals_lagged[['permno', 'date'] + char_cols]
+signals_lagged['ym'] = signals_lagged['ym'] + 1  # Shift period forward by 1 month
+signals_lagged = signals_lagged[['permno', 'ym'] + char_cols]
 
-# Debug: check date alignment before merge
-print(f"\n  Monthly returns date sample: {sorted(monthly_returns['date'].unique())[:3]}")
-print(f"  Signals lagged date sample:  {sorted(signals_lagged['date'].unique())[:3]}")
+# Debug: check alignment before merge
+print(f"\n  Monthly returns ym sample: {sorted(monthly_returns['ym'].unique())[:3]}")
+print(f"  Signals lagged ym sample:  {sorted(signals_lagged['ym'].unique())[:3]}")
+print(f"  Monthly returns permno dtype: {monthly_returns['permno'].dtype}")
+print(f"  Signals lagged permno dtype:  {signals_lagged['permno'].dtype}")
 
-# Merge with returns
+# Merge on year-month key (robust to day-of-month mismatches)
 merged_data = monthly_returns.merge(
     signals_lagged,
-    on=['permno', 'date'],
+    on=['permno', 'ym'],
     how='inner'
 )
+
+# Drop the ym key now that merge is done; keep 'date' from the returns side
+merged_data = merged_data.drop(columns=['ym'])
 
 print(f"\n✓ Merged data shape: {merged_data.shape}")
 print(f"  Observations: {len(merged_data):,}")
