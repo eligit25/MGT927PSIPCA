@@ -22,12 +22,6 @@ print("You'll be prompted to enter your WRDS username and password")
 
 db = wrds.Connection()
 print("Connected to WRDS successfully!")
-# Connect to WRDS
-print("\nConnecting to WRDS...")
-print("You'll be prompted to enter your WRDS username and password")
-
-db = wrds.Connection()
-print("Connected to WRDS successfully!")
 # Load the datashare.csv file
 print("\nLoading datashare.csv...")
 print("(This may take a minute for a large file...)")
@@ -92,6 +86,40 @@ if permno_col != 'permno':
 print(f"\n✓ Processed signals data:")
 print(f"  Date range: {signals_data['date'].min()} to {signals_data['date'].max()}")
 print(f"  Unique stocks: {signals_data['permno'].nunique():,}")
+# Identify characteristic columns (exclude identifiers and date columns)
+exclude_cols = ['permno', 'date', 'PERMNO', 'DATE', 'eom', 'yyyymm', 'DATE_', 'month', 'mdate',
+                'LPERMNO', 'permno_', 'PERMNO_', 'ret', 'RET', 'me', 'ME', 'mktcap']
+char_cols = [col for col in signals_data.columns if col not in exclude_cols]
+
+print(f"\n✓ Identified {len(char_cols)} characteristic columns")
+
+# Filter signals data: remove rows with too many missing characteristics
+signals_data_filtered = signals_data.dropna(subset=char_cols, thresh=int(len(char_cols) * 0.5))
+print(f"✓ Filtered signals data: {len(signals_data_filtered):,} rows remaining")
+
+# Fetch monthly returns from WRDS (CRSP)
+print("\nFetching monthly returns from CRSP...")
+
+monthly_returns = db.raw_sql("""
+    SELECT a.permno, a.date, a.ret, a.shrout, a.prc,
+           abs(a.prc) * a.shrout AS me
+    FROM crsp.msf AS a
+    INNER JOIN crsp.msenames AS b
+    ON a.permno = b.permno
+    AND b.namedt <= a.date
+    AND a.date <= b.nameendt
+    AND b.exchcd BETWEEN 1 AND 3
+    AND b.shrcd BETWEEN 10 AND 11
+    WHERE a.date BETWEEN '1960-01-01' AND '2023-12-31'
+    AND a.ret IS NOT NULL
+""")
+
+monthly_returns['date'] = pd.to_datetime(monthly_returns['date'])
+monthly_returns['date'] = monthly_returns['date'] + pd.offsets.MonthEnd(0)
+
+print(f"✓ Fetched {len(monthly_returns):,} monthly return observations")
+print(f"  Date range: {monthly_returns['date'].min()} to {monthly_returns['date'].max()}")
+print(f"  Unique stocks: {monthly_returns['permno'].nunique():,}")
 # Merge returns with lagged characteristics
 print("\n" + "="*80)
 print("MERGING DATA")
@@ -633,46 +661,6 @@ plt.tight_layout()
 plt.savefig('ipca_results.png', dpi=300, bbox_inches='tight')
 print("\n✓ Saved visualization to 'ipca_results.png'")
 plt.show()
-# Save results to CSV files
-
-print("\n" + "="*80)
-print("SAVING RESULTS")
-print("="*80)
-
-# Metrics summary
-metrics_summary = pd.DataFrame({
-    'Model': ['Full Sample', 'Small Cap', 'Large Cap'],
-    'Total_R2': [metrics_full['total_r2'], metrics_small['total_r2'], metrics_large['total_r2']],
-    'Relative_Pricing_Error': [metrics_full['relative_pricing_error'], 
-                                metrics_small['relative_pricing_error'], 
-                                metrics_large['relative_pricing_error']],
-    'Sharpe_Ratio': [metrics_full['sharpe_ratio'], metrics_small['sharpe_ratio'], metrics_large['sharpe_ratio']],
-    'N_Observations': [len(ipca_full.data), len(ipca_small.data), len(ipca_large.data)]
-})
-
-metrics_summary.to_csv('ipca_metrics_summary.csv', index=False)
-print("✓ Saved: ipca_metrics_summary.csv")
-
-# Gamma matrices
-gamma_df.to_csv('gamma_full_sample.csv')
-gamma_small_df.to_csv('gamma_small_cap.csv')
-gamma_large_df.to_csv('gamma_large_cap.csv')
-print("✓ Saved: gamma_*.csv files")
-
-# Factor time series
-ipca_full.factors.to_csv('factors_full_sample.csv')
-ipca_small.factors.to_csv('factors_small_cap.csv')
-ipca_large.factors.to_csv('factors_large_cap.csv')
-print("✓ Saved: factors_*.csv files")
-
-print("\n" + "="*80)
-print("✓ ANALYSIS COMPLETE!")
-print("="*80)
-print("\nGenerated files:")
-print("  - ipca_results.png (visualizations)")
-print("  - ipca_metrics_summary.csv (summary table)")
-print("  - gamma_*.csv (Gamma coefficient matrices)")
-print("  - factors_*.csv (factor time series)")
 # Save results to CSV files
 
 print("\n" + "="*80)
