@@ -242,21 +242,34 @@ class IPCA:
             how='inner'
         )
 
-        # Drop rows with missing values and reset index for clean iloc access
+        # Drop rows with missing values and reset index
         data = data.dropna().reset_index(drop=True)
 
         # Get unique dates and sort
         dates = sorted(data['date'].unique())
 
-        # Standardize characteristics within each time period
+        # Extract numpy arrays for all computation (avoids pandas .loc issues)
+        date_arr = data['date'].values
+        ret_arr = data['ret'].values.astype(float)
+        char_arr = data[char_cols].values.astype(float)  # shape (N, L)
+
+        # Standardize characteristics within each time period (pure numpy)
         print("  Standardizing characteristics...")
-        scaler = StandardScaler()
         for date in dates:
-            idx = data.index[data['date'] == date]
-            if len(idx) > 1:
-                data.loc[idx, char_cols] = scaler.fit_transform(
-                    data.loc[idx, char_cols].values
-                )
+            mask = date_arr == date
+            n = mask.sum()
+            if n > 1:
+                block = char_arr[mask]
+                means = block.mean(axis=0)
+                stds = block.std(axis=0)
+                stds[stds == 0] = 1.0  # avoid division by zero
+                char_arr[mask] = (block - means) / stds
+
+        # Build per-date index arrays for fast lookup in ALS iterations
+        date_indices = {}  # date -> array of row indices
+        for t, date in enumerate(dates):
+            idx = np.where(date_arr == date)[0]
+            date_indices[date] = idx
 
         # Initialize
         T = len(dates)
@@ -283,13 +296,13 @@ class IPCA:
 
             # Step 1: Update factors given Gamma
             for t, date in enumerate(dates):
-                data_t = data[data['date'] == date]
+                idx = date_indices[date]
 
-                if len(data_t) < 10:
+                if len(idx) < 10:
                     continue
 
-                Z_t = data_t[char_cols].values
-                r_t = data_t['ret'].values
+                Z_t = char_arr[idx]
+                r_t = ret_arr[idx]
                 beta_t = Z_t @ Gamma
 
                 try:
@@ -306,15 +319,15 @@ class IPCA:
             f_list = []
 
             for t, date in enumerate(dates):
-                data_t = data[data['date'] == date]
+                idx = date_indices[date]
 
-                if len(data_t) < 10:
+                if len(idx) < 10:
                     continue
 
-                Z_t = data_t[char_cols].values
-                r_t = data_t['ret'].values
+                Z_t = char_arr[idx]
+                r_t = ret_arr[idx]
 
-                for i in range(len(data_t)):
+                for i in range(len(idx)):
                     Z_list.append(Z_t[i, :])
                     r_list.append(r_t[i])
                     f_list.append(factors[t, :])
@@ -365,6 +378,10 @@ class IPCA:
         self.char_cols = char_cols
         self.data = data
         self.dates = dates
+        self.char_arr = char_arr
+        self.ret_arr = ret_arr
+        self.date_arr = date_arr
+        self.date_indices = date_indices
 
         return self
 
@@ -372,21 +389,24 @@ class IPCA:
         """Calculate Total R², Relative Pricing Error, and Spread Portfolio Sharpe Ratio"""
         print("\n  Calculating performance metrics...")
 
-        data = self.data
         dates = self.dates
+        char_arr = self.char_arr
+        ret_arr = self.ret_arr
+        date_indices = self.date_indices
+        permno_arr = self.data['permno'].values
 
         # Calculate fitted returns
         fitted_returns = []
         actual_returns = []
 
         for t, date in enumerate(dates):
-            data_t = data[data['date'] == date]
+            idx = date_indices[date]
 
-            if len(data_t) < 10:
+            if len(idx) < 10:
                 continue
 
-            Z_t = data_t[self.char_cols].values
-            r_t = data_t['ret'].values
+            Z_t = char_arr[idx]
+            r_t = ret_arr[idx]
             f_t = self.factors.loc[date].values
 
             beta_t = Z_t @ self.Gamma
@@ -403,24 +423,32 @@ class IPCA:
         ss_tot = np.sum(actual_returns**2)
         total_r2 = 1 - (ss_res / ss_tot)
 
-        # 2. Relative Pricing Error
+        # 2. Relative Pricing Error (using numpy arrays, no iterrows)
         alphas = {}
         mean_returns = {}
+        factors_matrix = self.factors.values  # (T, K)
 
-        for permno in data['permno'].unique():
-            stock_data = data[data['permno'] == permno]
+        # Build date-to-t mapping
+        date_to_t = {date: t for t, date in enumerate(dates)}
+
+        for permno in np.unique(permno_arr):
+            pmask = permno_arr == permno
+            p_ret = ret_arr[pmask]
+            p_char = char_arr[pmask]
+            p_dates = self.data['date'].values[pmask]
 
             r_actual_list = []
             r_fitted_list = []
 
-            for _, row in stock_data.iterrows():
-                date = row['date']
-                if date in self.factors.index:
-                    Z_i = row[self.char_cols].values.astype(float)
-                    f_t = self.factors.loc[date].values
+            for i in range(len(p_ret)):
+                d = p_dates[i]
+                if d in date_to_t:
+                    t = date_to_t[d]
+                    Z_i = p_char[i]
+                    f_t = factors_matrix[t]
                     beta_i = Z_i @ self.Gamma
 
-                    r_actual_list.append(row['ret'])
+                    r_actual_list.append(p_ret[i])
                     r_fitted_list.append(beta_i @ f_t)
 
             if len(r_actual_list) > 0:
@@ -434,27 +462,26 @@ class IPCA:
 
         # 3. Spread Portfolio Sharpe Ratio
         spread_returns = []
+        f_mean = self.factors.mean().values
 
         for t, date in enumerate(dates):
-            data_t = data[data['date'] == date].copy()
+            idx = date_indices[date]
 
-            if len(data_t) < 50:
+            if len(idx) < 50:
                 continue
 
-            Z_t = data_t[self.char_cols].values
-            f_mean = self.factors.mean().values
+            Z_t = char_arr[idx]
+            r_t = ret_arr[idx]
             beta_t = Z_t @ self.Gamma
             exp_ret_t = beta_t @ f_mean
 
-            data_t['exp_ret'] = exp_ret_t
-
             try:
-                data_t['quintile'] = pd.qcut(data_t['exp_ret'], 5, labels=False, duplicates='drop')
+                quintiles = pd.qcut(exp_ret_t, 5, labels=False, duplicates='drop')
             except ValueError:
                 continue
 
-            q5_ret = data_t[data_t['quintile'] == 4]['ret'].mean()
-            q1_ret = data_t[data_t['quintile'] == 0]['ret'].mean()
+            q5_ret = r_t[quintiles == 4].mean()
+            q1_ret = r_t[quintiles == 0].mean()
 
             if not (np.isnan(q5_ret) or np.isnan(q1_ret)):
                 spread_returns.append(q5_ret - q1_ret)
