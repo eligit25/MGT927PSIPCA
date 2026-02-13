@@ -75,8 +75,9 @@ if date_col is None:
     # You can manually set it here:
     # date_col = 'YOUR_DATE_COLUMN_NAME'
 
-# Convert to datetime
+# Convert to datetime and snap to month-end for consistent merging with CRSP
 signals_data['date'] = pd.to_datetime(signals_data[date_col])
+signals_data['date'] = signals_data['date'] + pd.offsets.MonthEnd(0)
 
 # Identify PERMNO column
 permno_col = None
@@ -145,7 +146,12 @@ print("="*80)
 signals_data_filtered = signals_data_filtered.sort_values(['permno', 'date'])
 signals_lagged = signals_data_filtered.copy()
 signals_lagged['date'] = signals_lagged['date'] + pd.DateOffset(months=1)
+signals_lagged['date'] = signals_lagged['date'] + pd.offsets.MonthEnd(0)
 signals_lagged = signals_lagged[['permno', 'date'] + char_cols]
+
+# Debug: check date alignment before merge
+print(f"\n  Monthly returns date sample: {sorted(monthly_returns['date'].unique())[:3]}")
+print(f"  Signals lagged date sample:  {sorted(signals_lagged['date'].unique())[:3]}")
 
 # Merge with returns
 merged_data = monthly_returns.merge(
